@@ -52,6 +52,60 @@ TARGET_NOISE_STD = 0.005
 HOME_POSITION = np.array([0.5, 0.0])
 
 
+class RosBridge:
+    """Thin helper around ``ros_shim.py`` for publishing telemetry and overrides."""
+
+    def __init__(self, requested: bool):
+        self.requested = bool(requested)
+        self.enabled = bool(requested and ROS_AVAILABLE)
+        self.publishers: Dict[str, object] = {}
+        self._target_override: Optional[np.ndarray] = None
+
+    def start(self) -> None:
+        if not self.enabled:
+            if self.requested and not ROS_AVAILABLE:
+                print("ROS shim unavailable; running offline.")
+            return
+        try:
+            rospy.init_node("servicing_arm")
+            self.publishers = {
+                "state": rospy.Publisher("/arm/state", rospy.std_msgs.String),
+                "cmd": rospy.Publisher("/arm/cmd", rospy.std_msgs.String),
+                "target": rospy.Publisher("/target/pose", rospy.std_msgs.String),
+            }
+
+            def _override_cb(msg: str) -> None:
+                try:
+                    data = json.loads(msg)
+                    if "target" in data:
+                        self._target_override = np.array(data["target"], dtype=float)
+                except Exception:
+                    pass
+
+            rospy.Subscriber("/external/commands", rospy.std_msgs.String, _override_cb)
+        except Exception as exc:  # pragma: no cover - depends on environment
+            print(f"ROS bridge disabled: {exc}")
+            self.enabled = False
+
+    @property
+    def target_override(self) -> Optional[np.ndarray]:
+        if self._target_override is None:
+            return None
+        return self._target_override.copy()
+
+    def publish(self, q: np.ndarray, qd: np.ndarray, x: np.ndarray, tau: np.ndarray, target: np.ndarray, phase: str) -> None:
+        if not self.enabled:
+            return
+        try:
+            self.publishers["state"].publish(
+                json.dumps({"q": q.tolist(), "qd": qd.tolist(), "x": x.tolist(), "phase": phase})
+            )
+            self.publishers["cmd"].publish(json.dumps({"tau": tau.tolist()}))
+            self.publishers["target"].publish(json.dumps({"x_t": target.tolist()}))
+        except Exception:
+            self.enabled = False
+
+
 class SimState:
     """Track interactive target state and provide non-blocking key polling."""
 
@@ -265,34 +319,8 @@ def simulate(args: argparse.Namespace) -> Tuple[Dict, Dict]:
     use_ros = bool(args.use_ros)
     rng = np.random.default_rng(42)
 
-    ros_active = False
-    ros_publishers = {}
-    target_override = {"pos": None}
-
-    if use_ros and ROS_AVAILABLE:
-        try:
-            rospy.init_node("servicing_arm")
-            ros_publishers = {
-                "state": rospy.Publisher("/arm/state", rospy.std_msgs.String),
-                "cmd": rospy.Publisher("/arm/cmd", rospy.std_msgs.String),
-                "target": rospy.Publisher("/target/pose", rospy.std_msgs.String),
-            }
-            ros_active = True
-
-            def _override_cb(msg: str) -> None:
-                try:
-                    data = json.loads(msg)
-                    if "target" in data:
-                        target_override["pos"] = np.array(data["target"], dtype=float)
-                except Exception:
-                    pass
-
-            rospy.Subscriber("/external/commands", rospy.std_msgs.String, _override_cb)
-        except Exception as exc:  # pragma: no cover - depends on environment
-            print(f"ROS bridge disabled: {exc}")
-            ros_active = False
-    elif use_ros:
-        print("ROS shim unavailable; running offline.")
+    ros_bridge = RosBridge(use_ros)
+    ros_bridge.start()
 
     q = np.zeros(3)
     qd = np.zeros(3)
@@ -356,8 +384,8 @@ def simulate(args: argparse.Namespace) -> Tuple[Dict, Dict]:
 
             target_nominal = target_origin + target_drift * t
             target_true = sim_state.current_target(target_nominal)
-            if target_override["pos"] is not None:
-                target_true = target_override["pos"]
+            if ros_bridge.target_override is not None:
+                target_true = ros_bridge.target_override
             target_meas = target_true + rng.normal(0.0, TARGET_NOISE_STD, size=2)
 
             phase_elapsed = t - phase_params["start_time"]
@@ -394,24 +422,7 @@ def simulate(args: argparse.Namespace) -> Tuple[Dict, Dict]:
                 damping += 0.2
                 capture_flag = True
 
-            if ros_active:
-                try:
-                    ros_publishers["state"].publish(
-                        json.dumps(
-                            {
-                                "q": q.tolist(),
-                                "qd": qd.tolist(),
-                                "x": x.tolist(),
-                                "phase": phase,
-                            }
-                        )
-                    )
-                    ros_publishers["cmd"].publish(json.dumps({"tau": tau.tolist()}))
-                    ros_publishers["target"].publish(
-                        json.dumps({"x_t": target_meas.tolist()})
-                    )
-                except Exception:
-                    ros_active = False
+            ros_bridge.publish(q, qd, x, tau, target_meas, phase)
 
             error = float(np.linalg.norm(x - target_meas))
             log_records.append(
