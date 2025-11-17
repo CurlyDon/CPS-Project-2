@@ -18,10 +18,19 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import matplotlib.pyplot as plt
+import select
+import sys
+
+try:
+    import termios
+    import tty
+except Exception:  # pragma: no cover - optional keyboard support
+    termios = None  # type: ignore
+    tty = None  # type: ignore
 
 try:  # Optional ROS shim
     import ros_shim as rospy  # type: ignore
@@ -41,6 +50,77 @@ TORQUE_LIMIT = 5.0
 LAM_DLS = 0.02
 TARGET_NOISE_STD = 0.005
 HOME_POSITION = np.array([0.5, 0.0])
+
+
+class SimState:
+    """Track interactive target state and provide non-blocking key polling."""
+
+    def __init__(self, x_t0: np.ndarray, step: float = 0.02):
+        self.x_t = x_t0.copy()
+        self.manual_override = False
+        self._step = step
+        self._stdin_fd: Optional[int] = None
+        self._orig_termios = None
+        self.enabled = bool(
+            termios is not None and tty is not None and sys.stdin.isatty()
+        )
+        if self.enabled:
+            try:
+                self._stdin_fd = sys.stdin.fileno()
+                self._orig_termios = termios.tcgetattr(self._stdin_fd)
+                tty.setcbreak(self._stdin_fd)
+            except Exception:
+                self.enabled = False
+                self._stdin_fd = None
+                self._orig_termios = None
+
+    def close(self) -> None:
+        if self.enabled and self._stdin_fd is not None and self._orig_termios is not None:
+            termios.tcsetattr(self._stdin_fd, termios.TCSADRAIN, self._orig_termios)
+        self.enabled = False
+
+    def __enter__(self) -> "SimState":
+        return self
+
+    def __exit__(self, exc_type, exc, exc_tb) -> None:
+        self.close()
+
+    def _input_ready(self) -> bool:
+        if not self.enabled:
+            return False
+        rlist, _, _ = select.select([sys.stdin], [], [], 0)
+        return bool(rlist)
+
+    def _delta_for_key(self, key: str) -> Optional[np.ndarray]:
+        mapping = {
+            "w": np.array([0.0, self._step]),
+            "s": np.array([0.0, -self._step]),
+            "a": np.array([-self._step, 0.0]),
+            "d": np.array([self._step, 0.0]),
+        }
+        key_lower = key.lower()
+        if key_lower in mapping:
+            return mapping[key_lower]
+        if key_lower == "r":
+            self.manual_override = False
+        return None
+
+    def poll_keyboard(self) -> None:
+        if not self.enabled:
+            return
+        while self._input_ready():
+            ch = sys.stdin.read(1)
+            if not ch:
+                break
+            delta = self._delta_for_key(ch)
+            if delta is not None:
+                self.x_t = self.x_t + delta
+                self.manual_override = True
+
+    def current_target(self, nominal: np.ndarray) -> np.ndarray:
+        if not self.manual_override:
+            self.x_t = nominal.copy()
+        return self.x_t.copy()
 
 
 def fk(q: np.ndarray) -> np.ndarray:
@@ -266,74 +346,88 @@ def simulate(args: argparse.Namespace) -> Tuple[Dict, Dict]:
     phase_params["x_goal"] = phase_goal(phase, target_origin)
 
     log_records: List[Dict] = []
+    sim_state = SimState(target_origin)
 
-    for step in range(steps):
-        t = step * dt
-        target_true = target_origin + target_drift * t
-        if target_override["pos"] is not None:
-            target_true = target_override["pos"]
-        target_meas = target_true + rng.normal(0.0, TARGET_NOISE_STD, size=2)
+    try:
+        for step in range(steps):
+            t = step * dt
 
-        phase_elapsed = t - phase_params["start_time"]
-        T = phase_params["duration"]
-        x_ref = min_jerk(phase_params["x_start"], phase_params["x_goal"], phase_elapsed, T)
+            sim_state.poll_keyboard()
 
-        dq = ik_dls(q_des, x_ref, dt, LAM_DLS)
-        q_des = q_des + dq * dt
-        qd_des = dq
+            target_nominal = target_origin + target_drift * t
+            target_true = sim_state.current_target(target_nominal)
+            if target_override["pos"] is not None:
+                target_true = target_override["pos"]
+            target_meas = target_true + rng.normal(0.0, TARGET_NOISE_STD, size=2)
 
-        tau, Ki_state = pid_step(q, qd, q_des, qd_des, Ki_state, dt, PID_GAINS)
-        tau = np.clip(tau, -TORQUE_LIMIT, TORQUE_LIMIT)
+            phase_elapsed = t - phase_params["start_time"]
+            T = phase_params["duration"]
+            x_ref = min_jerk(
+                phase_params["x_start"], phase_params["x_goal"], phase_elapsed, T
+            )
 
-        qdd = K_TAU * tau - damping * qd
-        qd = qd + qdd * dt
-        q = q + qd * dt
-        x = fk(q)
+            dq = ik_dls(q_des, x_ref, dt, LAM_DLS)
+            q_des = q_des + dq * dt
+            qd_des = dq
 
-        next_phase, new_t0, capture_event = fsm_next(phase, x, target_meas, t, phase_t0, thresholds)
-        if next_phase != phase:
-            phase = next_phase
-            phase_t0 = new_t0
-            phase_params = {
-                "start_time": t,
-                "duration": phase_durations.get(phase, 2.0),
-                "x_start": x_ref.copy(),
-                "x_goal": phase_goal(phase, target_meas),
-            }
-        if capture_event and not capture_flag:
-            damping += 0.2
-            capture_flag = True
+            tau, Ki_state = pid_step(q, qd, q_des, qd_des, Ki_state, dt, PID_GAINS)
+            tau = np.clip(tau, -TORQUE_LIMIT, TORQUE_LIMIT)
 
-        if ros_active:
-            try:
-                ros_publishers["state"].publish(
-                    json.dumps(
-                        {
-                            "q": q.tolist(),
-                            "qd": qd.tolist(),
-                            "x": x.tolist(),
-                            "phase": phase,
-                        }
+            qdd = K_TAU * tau - damping * qd
+            qd = qd + qdd * dt
+            q = q + qd * dt
+            x = fk(q)
+
+            next_phase, new_t0, capture_event = fsm_next(
+                phase, x, target_meas, t, phase_t0, thresholds
+            )
+            if next_phase != phase:
+                phase = next_phase
+                phase_t0 = new_t0
+                phase_params = {
+                    "start_time": t,
+                    "duration": phase_durations.get(phase, 2.0),
+                    "x_start": x_ref.copy(),
+                    "x_goal": phase_goal(phase, target_meas),
+                }
+            if capture_event and not capture_flag:
+                damping += 0.2
+                capture_flag = True
+
+            if ros_active:
+                try:
+                    ros_publishers["state"].publish(
+                        json.dumps(
+                            {
+                                "q": q.tolist(),
+                                "qd": qd.tolist(),
+                                "x": x.tolist(),
+                                "phase": phase,
+                            }
+                        )
                     )
-                )
-                ros_publishers["cmd"].publish(json.dumps({"tau": tau.tolist()}))
-                ros_publishers["target"].publish(json.dumps({"x_t": target_meas.tolist()}))
-            except Exception:
-                ros_active = False
+                    ros_publishers["cmd"].publish(json.dumps({"tau": tau.tolist()}))
+                    ros_publishers["target"].publish(
+                        json.dumps({"x_t": target_meas.tolist()})
+                    )
+                except Exception:
+                    ros_active = False
 
-        error = float(np.linalg.norm(x - target_meas))
-        log_records.append(
-            {
-                "t": t,
-                "phase": phase,
-                "q": q.tolist(),
-                "qd": qd.tolist(),
-                "x": x.tolist(),
-                "target": target_meas.tolist(),
-                "tau": tau.tolist(),
-                "error": error,
-            }
-        )
+            error = float(np.linalg.norm(x - target_meas))
+            log_records.append(
+                {
+                    "t": t,
+                    "phase": phase,
+                    "q": q.tolist(),
+                    "qd": qd.tolist(),
+                    "x": x.tolist(),
+                    "target": target_meas.tolist(),
+                    "tau": tau.tolist(),
+                    "error": error,
+                }
+            )
+    finally:
+        sim_state.close()
 
     final_info = {
         "final_x": x.tolist(),
