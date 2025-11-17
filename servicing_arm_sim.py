@@ -20,8 +20,16 @@ import json
 import os
 import select
 import sys
-import termios
-import tty
+
+try:
+    import termios
+    import tty
+
+    _HAS_TERMIOS = True
+except ImportError:  # pragma: no cover - platform specific
+    termios = None  # type: ignore
+    tty = None  # type: ignore
+    _HAS_TERMIOS = False
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -185,10 +193,10 @@ class KeyboardTargetController:
     """Handle non-blocking keyboard nudges of the target position."""
 
     def __init__(self, enabled: bool, step: float = 0.02) -> None:
-        self.enabled = enabled and sys.stdin.isatty()
+        self.enabled = enabled and sys.stdin.isatty() and _HAS_TERMIOS
         self.step = step
         self._term_settings = None
-        if self.enabled:
+        if self.enabled and termios and tty:
             try:
                 self._term_settings = termios.tcgetattr(sys.stdin)
                 tty.setcbreak(sys.stdin.fileno())
@@ -197,7 +205,7 @@ class KeyboardTargetController:
                 self._term_settings = None
 
     def close(self) -> None:
-        if self._term_settings is not None:
+        if self._term_settings is not None and termios:
             try:
                 termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._term_settings)
             except Exception:
