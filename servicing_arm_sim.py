@@ -22,15 +22,6 @@ from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import matplotlib.pyplot as plt
-import select
-import sys
-
-try:
-    import termios
-    import tty
-except Exception:  # pragma: no cover - optional keyboard support
-    termios = None  # type: ignore
-    tty = None  # type: ignore
 
 try:  # Optional ROS shim
     import ros_shim as rospy  # type: ignore
@@ -107,31 +98,14 @@ class RosBridge:
 
 
 class SimState:
-    """Track interactive target state and provide non-blocking key polling."""
+    """Track target state without relying on runtime keyboard input."""
 
-    def __init__(self, x_t0: np.ndarray, step: float = 0.02):
+    def __init__(self, x_t0: np.ndarray):
         self.x_t = x_t0.copy()
         self.manual_override = False
-        self._step = step
-        self._stdin_fd: Optional[int] = None
-        self._orig_termios = None
-        self.enabled = bool(
-            termios is not None and tty is not None and sys.stdin.isatty()
-        )
-        if self.enabled:
-            try:
-                self._stdin_fd = sys.stdin.fileno()
-                self._orig_termios = termios.tcgetattr(self._stdin_fd)
-                tty.setcbreak(self._stdin_fd)
-            except Exception:
-                self.enabled = False
-                self._stdin_fd = None
-                self._orig_termios = None
 
-    def close(self) -> None:
-        if self.enabled and self._stdin_fd is not None and self._orig_termios is not None:
-            termios.tcsetattr(self._stdin_fd, termios.TCSADRAIN, self._orig_termios)
-        self.enabled = False
+    def close(self) -> None:  # pragma: no cover - retained for API symmetry
+        """No-op retained for compatibility with prior context manager usage."""
 
     def __enter__(self) -> "SimState":
         return self
@@ -139,41 +113,11 @@ class SimState:
     def __exit__(self, exc_type, exc, exc_tb) -> None:
         self.close()
 
-    def _input_ready(self) -> bool:
-        if not self.enabled:
-            return False
-        rlist, _, _ = select.select([sys.stdin], [], [], 0)
-        return bool(rlist)
-
-    def _delta_for_key(self, key: str) -> Optional[np.ndarray]:
-        mapping = {
-            "w": np.array([0.0, self._step]),
-            "s": np.array([0.0, -self._step]),
-            "a": np.array([-self._step, 0.0]),
-            "d": np.array([self._step, 0.0]),
-        }
-        key_lower = key.lower()
-        if key_lower in mapping:
-            return mapping[key_lower]
-        if key_lower == "r":
-            self.manual_override = False
-        return None
-
     def poll_keyboard(self) -> None:
-        if not self.enabled:
-            return
-        while self._input_ready():
-            ch = sys.stdin.read(1)
-            if not ch:
-                break
-            delta = self._delta_for_key(ch)
-            if delta is not None:
-                self.x_t = self.x_t + delta
-                self.manual_override = True
+        """Keyboard interaction removed; method kept for compatibility."""
 
     def current_target(self, nominal: np.ndarray) -> np.ndarray:
-        if not self.manual_override:
-            self.x_t = nominal.copy()
+        self.x_t = nominal.copy()
         return self.x_t.copy()
 
 
