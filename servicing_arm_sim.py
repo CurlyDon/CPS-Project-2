@@ -18,6 +18,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import select
+import sys
+import termios
+import tty
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -177,6 +181,63 @@ def make_plots(log_dict: Dict, outdir: str) -> None:
     plt.close()
 
 
+class KeyboardTargetController:
+    """Handle non-blocking keyboard nudges of the target position."""
+
+    def __init__(self, enabled: bool, step: float = 0.02) -> None:
+        self.enabled = enabled and sys.stdin.isatty()
+        self.step = step
+        self._term_settings = None
+        if self.enabled:
+            try:
+                self._term_settings = termios.tcgetattr(sys.stdin)
+                tty.setcbreak(sys.stdin.fileno())
+            except Exception:
+                self.enabled = False
+                self._term_settings = None
+
+    def close(self) -> None:
+        if self._term_settings is not None:
+            try:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._term_settings)
+            except Exception:
+                pass
+            finally:
+                self._term_settings = None
+
+    def _get_key(self) -> str | None:
+        if not self.enabled:
+            return None
+        try:
+            dr, _, _ = select.select([sys.stdin], [], [], 0)
+        except Exception:
+            return None
+        if dr:
+            return sys.stdin.read(1)
+        return None
+
+    def update_offset(self, offset: np.ndarray) -> np.ndarray:
+        if not self.enabled:
+            return offset
+        key = self._get_key()
+        if not key:
+            return offset
+        delta = np.zeros_like(offset)
+        if key == "w":
+            delta[1] = self.step
+        elif key == "s":
+            delta[1] = -self.step
+        elif key == "a":
+            delta[0] = -self.step
+        elif key == "d":
+            delta[0] = self.step
+        elif key == " ":
+            return np.zeros_like(offset)
+        if np.any(delta):
+            return offset + delta
+        return offset
+
+
 def simulate(args: argparse.Namespace) -> Tuple[Dict, Dict]:
     """Run the servicing arm simulation and return logs plus summary info."""
 
@@ -224,6 +285,8 @@ def simulate(args: argparse.Namespace) -> Tuple[Dict, Dict]:
 
     target_origin = np.array([1.0, 0.2])
     target_drift = np.array([-0.01, 0.0])
+    keyboard_controller = KeyboardTargetController(bool(getattr(args, "keyboard", 1)))
+    keyboard_offset = np.zeros(2)
 
     phase = "SEARCH"
     phase_t0 = 0.0
@@ -267,73 +330,78 @@ def simulate(args: argparse.Namespace) -> Tuple[Dict, Dict]:
 
     log_records: List[Dict] = []
 
-    for step in range(steps):
-        t = step * dt
-        target_true = target_origin + target_drift * t
-        if target_override["pos"] is not None:
-            target_true = target_override["pos"]
-        target_meas = target_true + rng.normal(0.0, TARGET_NOISE_STD, size=2)
+    try:
+        for step in range(steps):
+            t = step * dt
+            if keyboard_controller.enabled:
+                keyboard_offset = keyboard_controller.update_offset(keyboard_offset)
+            target_true = target_origin + target_drift * t + keyboard_offset
+            if target_override["pos"] is not None:
+                target_true = target_override["pos"]
+            target_meas = target_true + rng.normal(0.0, TARGET_NOISE_STD, size=2)
 
-        phase_elapsed = t - phase_params["start_time"]
-        T = phase_params["duration"]
-        x_ref = min_jerk(phase_params["x_start"], phase_params["x_goal"], phase_elapsed, T)
+            phase_elapsed = t - phase_params["start_time"]
+            T = phase_params["duration"]
+            x_ref = min_jerk(phase_params["x_start"], phase_params["x_goal"], phase_elapsed, T)
 
-        dq = ik_dls(q_des, x_ref, dt, LAM_DLS)
-        q_des = q_des + dq * dt
-        qd_des = dq
+            dq = ik_dls(q_des, x_ref, dt, LAM_DLS)
+            q_des = q_des + dq * dt
+            qd_des = dq
 
-        tau, Ki_state = pid_step(q, qd, q_des, qd_des, Ki_state, dt, PID_GAINS)
-        tau = np.clip(tau, -TORQUE_LIMIT, TORQUE_LIMIT)
+            tau, Ki_state = pid_step(q, qd, q_des, qd_des, Ki_state, dt, PID_GAINS)
+            tau = np.clip(tau, -TORQUE_LIMIT, TORQUE_LIMIT)
 
-        qdd = K_TAU * tau - damping * qd
-        qd = qd + qdd * dt
-        q = q + qd * dt
-        x = fk(q)
+            qdd = K_TAU * tau - damping * qd
+            qd = qd + qdd * dt
+            q = q + qd * dt
+            x = fk(q)
 
-        next_phase, new_t0, capture_event = fsm_next(phase, x, target_meas, t, phase_t0, thresholds)
-        if next_phase != phase:
-            phase = next_phase
-            phase_t0 = new_t0
-            phase_params = {
-                "start_time": t,
-                "duration": phase_durations.get(phase, 2.0),
-                "x_start": x_ref.copy(),
-                "x_goal": phase_goal(phase, target_meas),
-            }
-        if capture_event and not capture_flag:
-            damping += 0.2
-            capture_flag = True
+            next_phase, new_t0, capture_event = fsm_next(phase, x, target_meas, t, phase_t0, thresholds)
+            if next_phase != phase:
+                phase = next_phase
+                phase_t0 = new_t0
+                phase_params = {
+                    "start_time": t,
+                    "duration": phase_durations.get(phase, 2.0),
+                    "x_start": x_ref.copy(),
+                    "x_goal": phase_goal(phase, target_meas),
+                }
+            if capture_event and not capture_flag:
+                damping += 0.2
+                capture_flag = True
 
-        if ros_active:
-            try:
-                ros_publishers["state"].publish(
-                    json.dumps(
-                        {
-                            "q": q.tolist(),
-                            "qd": qd.tolist(),
-                            "x": x.tolist(),
-                            "phase": phase,
-                        }
+            if ros_active:
+                try:
+                    ros_publishers["state"].publish(
+                        json.dumps(
+                            {
+                                "q": q.tolist(),
+                                "qd": qd.tolist(),
+                                "x": x.tolist(),
+                                "phase": phase,
+                            }
+                        )
                     )
-                )
-                ros_publishers["cmd"].publish(json.dumps({"tau": tau.tolist()}))
-                ros_publishers["target"].publish(json.dumps({"x_t": target_meas.tolist()}))
-            except Exception:
-                ros_active = False
+                    ros_publishers["cmd"].publish(json.dumps({"tau": tau.tolist()}))
+                    ros_publishers["target"].publish(json.dumps({"x_t": target_meas.tolist()}))
+                except Exception:
+                    ros_active = False
 
-        error = float(np.linalg.norm(x - target_meas))
-        log_records.append(
-            {
-                "t": t,
-                "phase": phase,
-                "q": q.tolist(),
-                "qd": qd.tolist(),
-                "x": x.tolist(),
-                "target": target_meas.tolist(),
-                "tau": tau.tolist(),
-                "error": error,
-            }
-        )
+            error = float(np.linalg.norm(x - target_meas))
+            log_records.append(
+                {
+                    "t": t,
+                    "phase": phase,
+                    "q": q.tolist(),
+                    "qd": qd.tolist(),
+                    "x": x.tolist(),
+                    "target": target_meas.tolist(),
+                    "tau": tau.tolist(),
+                    "error": error,
+                }
+            )
+    finally:
+        keyboard_controller.close()
 
     final_info = {
         "final_x": x.tolist(),
@@ -354,6 +422,12 @@ def main() -> None:
     parser.add_argument("--dt", type=float, default=0.005, help="Time step [s]")
     parser.add_argument("--plots", type=int, default=1, help="Generate plots (1/0)")
     parser.add_argument("--use_ros", type=int, default=0, help="Enable ROS shim (1/0)")
+    parser.add_argument(
+        "--keyboard",
+        type=int,
+        default=1,
+        help="Enable WASD keyboard target nudges (1/0)",
+    )
     args = parser.parse_args()
 
     log_dict, final_info = simulate(args)
